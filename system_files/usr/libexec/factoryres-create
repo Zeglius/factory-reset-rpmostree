@@ -1,0 +1,224 @@
+#!/usr/bin/bash
+# shellcheck disable=SC2004
+
+#region Initial state vars
+readonly SCRIPTNAME="${0##*/}"
+readonly PREFIX=/var/factoryres
+readonly -a SRCS=(
+    /etc
+    /var/usrlocal
+    /var/roothome
+    # /var/lib
+)
+declare -i DRY_RUN=0
+declare -i VERBOSE=0
+COPY_BACKEND=${COPY_BACKEND:-tar}
+#endregion Initial state vars
+
+#region Init
+# Check if we are using a compatible bash version
+if ((${BASH_VERSINFO[0]} < 5)); then
+    echo "ERR: Bash major version should be >= 5" >&2
+    exit 1
+fi
+
+# Remove any overriden function.
+# See https://github.com/Homebrew/brew/blob/f5adff9d9005dddd1e9057cac54d15cbbcefc4dd/bin/brew#L52
+builtin enable compgen unset
+for cmd in $(builtin compgen -A builtin); do
+    builtin unset -f "$cmd"
+    builtin enable "$cmd"
+done
+unset -v cmd
+
+# Prepare factoryres directories
+_init_dirs() {
+    # shellcheck disable=SC2064
+    trap "eval $(set +o)" EXIT
+    set -euo pipefail
+    if [[ ! -d $PREFIX ]]; then
+        mkdir $PREFIX $PREFIX/snapshot
+    fi
+    if [[ ! -f $PREFIX/.metadata.env ]]; then
+        touch $PREFIX/.metadata.env
+    fi
+}
+#endregion Init
+
+#region Functions
+
+_help() {
+    read -r -d '' HELPDOC <<EOF
+${SCRIPTNAME}: Create a restore point
+
+Usage: ${SCRIPTNAME} [-h|--help] [-v|--verbose] [create]
+    -h --help       Show this message
+    -v --verbose    Increase verbosity
+
+Subcommands:
+    create          Create a restore point
+EOF
+    echo "${HELPDOC}"
+}
+
+_eval_init_verbose() {
+    (($VERBOSE == 1)) && echo "trap 'set +x' EXIT && set -x"
+}
+
+# Check if we are running as root
+_is_root() {
+    [[ $EUID -eq 0 ]]
+    return $?
+}
+
+# Check if we are running in a rpm-ostree based distro
+_ensure_rpmostree() {
+    local -i result=0 # 0 equals false, 1 equals true
+    # shellcheck disable=SC2016
+    local -a eval_checks=(
+        '[[ -d /ostree ]]'
+        '[[ -d /ostree ]]'
+        '[[ -d /sysroot/ostree ]]'
+        '[[ $(readlink -vf /home) =~ ^/var/home$ ]]'
+    )
+    local test
+    for test in "${eval_checks[@]}"; do
+        result=$(
+            eval "$test"
+            echo $?
+        )
+        # Exit code was not 0, break loop, report error
+        [[ $result -ne 0 ]] && break
+    done
+    return $result
+}
+
+# Create a snapshot of /etc, /var/home, /var/usrlocal, /var/roothome, /var/lib
+_create_snapshot() {
+    # shellcheck disable=SC2064
+    trap "eval $(set +o)" EXIT
+    set -euo pipefail
+    eval "$(_eval_init_verbose)"
+
+    # Check we are root
+    if ! _is_root; then
+        echo >&2 "ERROR: This script needs to run as root"
+        exit 1
+    fi
+    # Check we are in rpm-ostree
+    if ! _ensure_rpmostree; then
+        echo >&2 "ERROR: This script only works in rpm-ostree based distros"
+        exit 1
+    fi
+
+    # Create snapshot
+    _init_dirs
+    # cp -t $PREFIX/snapshot -av "${SRCS[@]}"
+    for SRC in "${SRCS[@]}"; do
+        local dest_suffix
+        local dest
+        dest_suffix=${SRC##/}
+        dest_suffix=-${dest_suffix//\//-}
+        dest="$PREFIX/snapshot/snapshot${dest_suffix}"
+        case $COPY_BACKEND in
+        cp)
+            {
+                mkdir -p "$dest"
+                cp \
+                    -a \
+                    --debug \
+                    -t "$dest" \
+                    "${SRC}"
+            } >&2
+            ;;
+
+        tar | *)
+            {
+                dest="$dest.tar"
+                tar \
+                    --selinux \
+                    --acls \
+                    --preserve-permissions \
+                    --atime-preserve=replace \
+                    -cvf "$dest" \
+                    "${SRC}"
+            } >&2
+            ;;
+        esac
+    done
+}
+
+#endregion Functions
+
+#region Entrypoint
+
+main() {
+    set -uo pipefail
+    ACTION=
+    FLAGS=()
+
+    if (($# <= 0)); then
+        _help >&2
+        exit
+    fi
+
+    # Parse args
+    while (($# > 0)); do
+        # shellcheck disable=SC2124
+        case "$1" in
+        -h | --help)
+            _help
+            exit 0
+            ;;
+
+        -v | --verbose)
+            VERBOSE=1
+            shift
+            ;;
+
+        -n)
+            DRY_RUN=1
+            shift
+            ;;
+
+        create)
+            if ! _is_root; then
+                echo >&2 "ERROR: This script needs to run as root"
+                exit 1
+            fi
+            ACTION="create"
+            shift
+            ;;
+
+        -?)
+            FLAGS+=("${arg#-}")
+            shift
+            ;;
+
+        *)
+            _help >&2
+            exit 1
+            ;;
+        esac
+    done
+
+    case $ACTION in
+    create)
+        (
+            (($DRY_RUN == 1)) && {
+                set -n
+            }
+            _create_snapshot
+            exit $?
+        )
+        ;;
+    "")
+        _help >&2
+        exit 1
+        ;;
+    esac
+}
+
+main "$@"
+
+#endregion Entrypoint
